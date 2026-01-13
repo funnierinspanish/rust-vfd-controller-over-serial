@@ -10,8 +10,8 @@ const CMD_US: u8 = 0x1F;
 enum TextFit {
     OneLine,
     NeedsWrap,
-    NeedsWrapAround,
     TooLong,
+    OneLineTruncated,
 }
 
 struct BirchVfd {
@@ -66,6 +66,7 @@ impl BirchVfd {
                 e
             ),
         }
+        self.set_cursor(0, 0).expect("Failed to position cursor");
         Ok(())
     }
 
@@ -84,109 +85,93 @@ impl BirchVfd {
     }
 
     fn write(&mut self, text: &str) -> Result<(), io::Error> {
-      self.port.write_all(text.as_bytes()).expect("Failed to write to serial port.");
-      Ok(())
+        self.port
+            .write_all(text.as_bytes())
+            .expect("Failed to write to serial port.");
+        Ok(())
     }
 
     // Write a single line to the display
     pub fn writeln(&mut self, text: &str) -> Result<(), io::Error> {
-        
-        // Check if the text would fit
-        match self.get_text_fit(text, false, false) {
-            TextFit::OneLine => {
-                self.write(text).expect("Failed to write line");
-            }
-            TextFit::NeedsWrap | TextFit::NeedsWrapAround => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Text requires wrapping, use the `write_text` method instead.",
-                ));
-            }
-            TextFit::TooLong => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "Text too long to fit on display. A maximum of {} characters can be displayed, but {} were provided.",
-                        (self.width as usize) * (self.height as usize),
-                        text.len()
-                    ),
-                ));
-            }
-        }
+        self.write(text).expect("Failed to write line");
         Ok(())
     }
 
-    fn write_multi_line(
-        &mut self,
-        text: &str,
-        can_wrap_around: bool,
-        can_truncate: bool,
-    ) -> Result<(), io::Error> {
+    // Write a single line to the display and truncate if necessary
+    pub fn writeln_truncate(&mut self, text: &str) -> Result<(), io::Error> {
+        let space_available = self.get_space_available_on_line();
+        let truncated_text = &text.as_bytes()[..space_available];
+        let truncated_str = String::from_utf8_lossy(truncated_text).to_string();
+
+        self.write(&truncated_str)
+            .expect("Failed to write truncated line");
+        Ok(())
+    }
+
+    fn write_multi_line(&mut self, text: &str) -> Result<(), io::Error> {
         let mut remaining_bytes = text.as_bytes();
-        // Use clearer variable names for readability
         while !remaining_bytes.is_empty() {
             let (cursor_x, cursor_y) = self.get_cursor();
             let space_available = (self.width - cursor_x) as usize;
             let bytes_to_take = space_available.min(remaining_bytes.len());
-            let chunk = String::from_utf8_lossy(&remaining_bytes[..bytes_to_take]);
+            let chunk = String::from_utf8_lossy(&remaining_bytes[..bytes_to_take])
+                .trim()
+                .to_string();
 
             self.write(&chunk).expect("Failed to write chunk");
             remaining_bytes = &remaining_bytes[bytes_to_take..];
 
-            
             if remaining_bytes.is_empty() {
-              break;
-            }
-            
-            let new_line_available = cursor_y + 1 < self.height;
-
-            if !remaining_bytes.is_empty() && !new_line_available {
-                if can_truncate {
-                    self.set_cursor(self.width, self.height)
-                        .expect("Failed to set cursor at end");
-                    break;
-                }
-                if !can_wrap_around {
-                    self.set_cursor(self.width, self.height)
-                        .expect("Failed to set cursor at end");
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Not enough space to write text and wrap around is disabled.",
-                    ));
-                } else {
-                    self.set_cursor(0, cursor_y + 1)
-                        .expect("Failed to set cursor for wrap_line");
-                }
+                break;
             } else {
                 self.set_cursor(0, cursor_y + 1)
-                    .expect("Failed to set cursor at the beginning of new line");
+                    .expect("Failed to set cursor for wrap_line");
             }
         }
 
         Ok(())
     }
 
-    pub fn write_text(
-        &mut self,
-        text: &str,
-        can_wrap_around: bool,
-        can_truncate: bool,
-    ) -> Result<(), io::Error> {
+    fn get_space_available_on_line(&self) -> usize {
+        let (cursor_x, _) = self.get_cursor();
+        (self.width - cursor_x) as usize
+    }
+
+    fn get_lines_available(&self) -> usize {
+        let (_, cursor_y) = self.get_cursor();
+        (self.height - (cursor_y + 1)) as usize
+    }
+
+    pub fn write_text(&mut self, text: &str) -> Result<(), io::Error> {
+        self.write_text_handler(text, false)
+    }
+
+    pub fn write_text_truncate(&mut self, text: &str) -> Result<(), io::Error> {
+        self.write_text_handler(text, true)
+    }
+
+    fn write_text_handler(&mut self, text: &str, truncate: bool) -> Result<(), io::Error> {
         // Check if the text would fit
-        match self.get_text_fit(text, can_wrap_around, can_truncate) {
+        let space_left_on_line = self.get_space_available_on_line();
+
+        match self.get_text_fit(text, truncate) {
             TextFit::OneLine => {
-                self.write(text).expect("Failed to write line");
+                self.writeln(text).expect("Failed to write line");
             }
-            TextFit::NeedsWrap | TextFit::NeedsWrapAround => {
-                self.write_multi_line(text, can_wrap_around, can_truncate)
+            TextFit::OneLineTruncated => {
+                self.writeln_truncate(text).expect("Failed to write line");
+            }
+            TextFit::NeedsWrap => {
+                self.write_multi_line(text)
                     .expect("Failed to write multi line");
             }
             TextFit::TooLong => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     format!(
-                        "Text too long to fit on display. A maximum of {} characters can be displayed, but {} were provided.",
-                        (self.width as usize) * (self.height as usize),
+                        "Text too long to fit on display. A maximum of {} characters are available from the current cursor position: {}, {}. {} characters were provided.",
+                        space_left_on_line * self.get_lines_available(),
+                        self.get_cursor().0,
+                        self.get_cursor().1,
                         text.len()
                     ),
                 ));
@@ -199,7 +184,7 @@ impl BirchVfd {
     // Determine if the text fits on the display and how to handle it
     //  based on the current cursor position, display size,
     //  and user preferences for wrapping and truncation.
-    fn get_text_fit(&self, text: &str, can_wrap_around: bool, can_truncate: bool) -> TextFit {
+    fn get_text_fit(&self, text: &str, truncate: bool) -> TextFit {
         let bytes = text.as_bytes();
         let text_length = bytes.len() as u8;
 
@@ -211,18 +196,16 @@ impl BirchVfd {
             return TextFit::OneLine;
         }
 
-        // Text is longer than one line
-        if lines_left <= 0 || space_left_on_line + (lines_left * self.width) < text_length {
-            if can_wrap_around {
-                return TextFit::NeedsWrapAround;
-            } else if can_truncate {
-                return TextFit::NeedsWrap;
-            } else {
-                return TextFit::TooLong;
-            }
+        if cursor_x < self.width && truncate {
+            return TextFit::OneLineTruncated;
         }
 
-        TextFit::NeedsWrap
+        // Text is longer than one line, but still would fit if wrapped
+        if space_left_on_line + (lines_left * self.width) >= text_length {
+            TextFit::NeedsWrap
+        } else {
+            TextFit::TooLong
+        }
     }
 }
 
@@ -234,11 +217,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     vfd.clear().expect("Failed to clear display");
 
     vfd.set_cursor(0, 0).expect("Failed to position cursor");
-    vfd.writeln("Epale!")
+
+    vfd.writeln("Epale!").expect("Failed to write to display");
+
+    sleep(Duration::from_secs(1));
+
+    vfd.set_cursor(7, 0).expect("Failed to position cursor");
+
+    sleep(Duration::from_secs(2));
+    vfd.write_text(":) yuju!")
         .expect("Failed to write to display");
     sleep(Duration::from_secs(2));
+
     vfd.clear().expect("Failed to clear display");
-    vfd.write_text("Rust speaking serial to a *VFD* :)", false, true)
+
+    vfd.write_text("Rust speaking serial to a *VFD* :)")
         .expect("Failed to write to display");
 
     Ok(())
